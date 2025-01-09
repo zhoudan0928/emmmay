@@ -128,6 +128,12 @@ const proxyOptions = {
             }
             const stats = streamStats.get(streamId);
 
+            // 设置缓存控制，忽略查询字符串
+            proxyRes.headers['Cache-Control'] = 'public, max-age=3600, s-maxage=3600, proxy-revalidate';
+            proxyRes.headers['Vary'] = 'Accept-Encoding';
+            // 添加缓存键控制，忽略查询参数
+            proxyRes.headers['CDN-Cache-Control'] = 'ignore-query-strings';
+            
             // 只对媒体流进行速度监控
             const originalWrite = res.write;
             const originalEnd = res.end;
