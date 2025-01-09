@@ -1,0 +1,13 @@
+{
+  "name": "emby-proxy",
+  "version": "1.0.0",
+  "description": "Emby proxy service",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "ws": "^8.16.0"
+  }
+} 
