@@ -1,159 +1,208 @@
 const express = require('express');
-const { WebSocket, WebSocketServer } = require('ws');
-const http = require('http');
-const https = require('https');
-const { URL } = require('url');
+const { createProxyMiddleware } = require('http-proxy-middleware');
+const compression = require('compression');
+require('dotenv').config();
 
 const app = express();
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
+const port = process.env.PORT || 7860;  // 支持Koyeb的PORT环境变量
 
-const PORT = process.env.PORT || 8080;
-const TARGET_HOST = process.env.EMBY_SERVER || ''; // emby地址
+// 用于存储视频流的统计信息
+const streamStats = new Map();
 
-if (!TARGET_HOST) {
+// 清理超时的统计信息
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, stats] of streamStats.entries()) {
+        if (now - stats.lastUpdate > 30000) { // 30秒无更新则清理
+            streamStats.delete(key);
+        }
+    }
+}, 30000);
+
+// 用于记录速度的函数
+function logSpeed(req, stats, totalBytes, proxyResponseTime, isEnd = false) {
+    const now = Date.now();
+    const totalTimeToProxy = proxyResponseTime - req.startTime;
+    const totalTimeToClient = now - proxyResponseTime;
+    
+    // 从响应头中获取实际的传输字节数
+    const range = req.headers.range || '';
+    
+    // 计算实际的传输速度
+    // HF Space到Emby服务器的下载速度
+    const downloadSpeed = totalBytes / (totalTimeToProxy / 1000);
+    // 客户端到HF Space的上传速度（实际传输的数据量）
+    const uploadSpeed = totalBytes / (totalTimeToClient / 1000);
+
+    // 计算累积平均速度
+    const avgDownloadSpeed = stats.totalBytes / (stats.totalTimeToProxy / 1000);
+    const avgUploadSpeed = stats.totalBytes / (stats.totalTimeToClient / 1000);
+    
+    // 记录速度日志
+    console.log(`\n[${new Date().toISOString()}] 媒体流请求: ${req.url}`);
+    if (range) {
+        console.log(`Range: ${range}`);
+    }
+    console.log(`${isEnd ? '最终' : '当前'}统计:`);
+    console.log(`  客户端到HF Space: ${(uploadSpeed / 1024 / 1024).toFixed(2)} MB/s (${(totalBytes / 1024 / 1024).toFixed(2)}MB in ${totalTimeToClient}ms)`);
+    console.log(`  HF Space到Emby服务器: ${(downloadSpeed / 1024 / 1024).toFixed(2)} MB/s (${(totalBytes / 1024 / 1024).toFixed(2)}MB in ${totalTimeToProxy}ms)`);
+    if (stats.chunks > 0) {
+        console.log(`累积统计 (${stats.chunks} 个分片):`);
+        console.log(`  平均上传速度: ${(avgUploadSpeed / 1024 / 1024).toFixed(2)} MB/s`);
+        console.log(`  平均下载速度: ${(avgDownloadSpeed / 1024 / 1024).toFixed(2)} MB/s`);
+        console.log(`  总传输: ${(stats.totalBytes / 1024 / 1024).toFixed(2)}MB`);
+    }
+    console.log('-------------------');
+}
+
+// 启用压缩，但排除视频流
+app.use(compression({
+    filter: (req, res) => {
+        const contentType = res.getHeader('Content-Type') || '';
+        return !contentType.includes('video/') && !contentType.includes('audio/') && compression.filter(req, res);
+    }
+}));
+
+// 从环境变量获取 Emby 服务器地址
+const EMBY_SERVER = process.env.EMBY_SERVER || '';
+
+if (!EMBY_SERVER) {
     console.error('EMBY_SERVER environment variable is not set');
     process.exit(1);
 }
-
-// 日志函数
-function log(message) {
-    console.log(`[${new Date().toISOString()}] ${message}`);
-}
-
-// 获取默认User-Agent
-function getDefaultUserAgent(isMobile = false) {
-    if (isMobile) {
-        return "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36";
-    } else {
-        return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
-    }
-}
-
-// 转换请求头
-function transformHeaders(headers) {
-    const isMobile = headers['sec-ch-ua-mobile'] === '?1';
-    const newHeaders = { ...headers };
-    newHeaders['user-agent'] = getDefaultUserAgent(isMobile);
-    newHeaders['host'] = new URL(TARGET_HOST).host;
-    newHeaders['origin'] = TARGET_HOST;
-    return newHeaders;
-}
-
-// 处理WebSocket连接
-wss.on('connection', (ws, req) => {
-    const url = new URL(req.url, TARGET_HOST);
-    const targetUrl = `wss://${url.host}${url.pathname}${url.search}`;
-    log(`建立WebSocket连接: ${targetUrl}`);
-
-    const serverWs = new WebSocket(targetUrl, {
-        headers: transformHeaders(req.headers)
-    });
-
-    ws.on('message', (data) => {
-        if (serverWs.readyState === WebSocket.OPEN) {
-            serverWs.send(data);
-        }
-    });
-
-    serverWs.on('message', (data) => {
-        if (ws.readyState === WebSocket.OPEN) {
-            ws.send(data);
-        }
-    });
-
-    ws.on('close', () => {
-        if (serverWs.readyState === WebSocket.OPEN) {
-            serverWs.close();
-        }
-    });
-
-    serverWs.on('close', () => {
-        if (ws.readyState === WebSocket.OPEN) {
-            ws.close();
-        }
-    });
-
-    ws.on('error', (error) => {
-        log(`客户端WebSocket错误: ${error.message}`);
-    });
-
-    serverWs.on('error', (error) => {
-        log(`服务器WebSocket错误: ${error.message}`);
-    });
-});
-
-// 处理HTTP请求
-app.use(async (req, res) => {
-    try {
-        // 处理WebSocket升级请求
-        if (req.headers.upgrade && req.headers.upgrade.toLowerCase() === 'websocket') {
-            return; // 让WebSocket服务器处理
-        }
-
-        const url = new URL(req.url, TARGET_HOST);
-        const targetUrl = `${TARGET_HOST}${url.pathname}${url.search}`;
-        log(`代理HTTP请求: ${targetUrl}`);
-
-        // 创建请求选项
-        const options = {
-            method: req.method,
-            headers: transformHeaders(req.headers),
-            timeout: 30000,
-        };
-
-        // 发送代理请求
-        const proxyReq = https.request(targetUrl, options);
-
-        // 转发请求体
-        if (req.method !== 'GET' && req.method !== 'HEAD') {
-            req.pipe(proxyReq);
-        } else {
-            proxyReq.end();
-        }
-
-        // 处理代理响应
-        proxyReq.on('response', (proxyRes) => {
-            // 设置响应头
-            res.writeHead(proxyRes.statusCode, {
-                ...proxyRes.headers,
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-                'Access-Control-Allow-Headers': '*'
-            });
-
-            // 转发响应体
-            proxyRes.pipe(res);
-        });
-
-        // 错误处理
-        proxyReq.on('error', (error) => {
-            log(`代理请求错误: ${error.message}`);
-            if (!res.headersSent) {
-                res.status(502).json({
-                    error: 'Proxy Error',
-                    message: error.message
-                });
-            }
-        });
-
-    } catch (error) {
-        log(`错误: ${error.message}`);
-        if (!res.headersSent) {
-            res.status(500).json({
-                error: 'Internal Server Error',
-                message: error.message
-            });
-        }
-    }
-});
 
 // 健康检查端点
 app.get('/healthz', (req, res) => {
     res.json({ status: 'healthy' });
 });
 
+// 配置代理选项
+const proxyOptions = {
+    target: EMBY_SERVER,
+    changeOrigin: true,
+    secure: false,
+    ws: true,
+    xfwd: true,
+    proxyTimeout: 0,    // 禁用超时
+    timeout: 0,         // 禁用超时
+    onProxyReq: (proxyReq, req) => {
+        // 记录请求开始时间
+        req.startTime = Date.now();
+        req.bytesWritten = 0;
+        req.lastLogTime = Date.now();
+
+        // 添加必要的请求头
+        proxyReq.setHeader('X-Forwarded-For', req.ip);
+        proxyReq.setHeader('X-Forwarded-Proto', 'https');
+    },
+    onProxyRes: (proxyRes, req, res) => {
+        // 记录代理服务器响应时间
+        const proxyResponseTime = Date.now();
+        let totalBytes = 0;
+
+        // 删除可能导致问题的响应头
+        delete proxyRes.headers['strict-transport-security'];
+        delete proxyRes.headers['content-security-policy'];
+        
+        // 添加 CORS 头
+        proxyRes.headers['Access-Control-Allow-Origin'] = '*';
+        proxyRes.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS';
+        proxyRes.headers['Access-Control-Allow-Headers'] = '*';
+
+        // 检查是否是视频或音频流
+        const contentType = proxyRes.headers['content-type'] || '';
+        const isMediaStream = contentType.includes('video/') || contentType.includes('audio/');
+
+        if (isMediaStream) {
+            // 获取或创建视频流统计信息
+            const streamId = req.url.split('?')[0]; // 使用不带参数的URL作为标识
+            if (!streamStats.has(streamId)) {
+                streamStats.set(streamId, {
+                    totalBytes: 0,
+                    chunks: 0,
+                    startTime: Date.now(),
+                    lastUpdate: Date.now(),
+                    totalTimeToProxy: 0,
+                    totalTimeToClient: 0
+                });
+            }
+            const stats = streamStats.get(streamId);
+
+            // 只对媒体流进行速度监控
+            const originalWrite = res.write;
+            const originalEnd = res.end;
+
+            res.write = function(chunk, encoding, callback) {
+                const now = Date.now();
+                if (chunk) {
+                    totalBytes += chunk.length;
+                    stats.totalBytes += chunk.length;
+                    
+                    // 每秒最多更新一次日志
+                    if (now - req.lastLogTime >= 1000) {
+                        stats.totalTimeToProxy = proxyResponseTime - req.startTime;
+                        stats.totalTimeToClient = now - proxyResponseTime;
+                        logSpeed(req, stats, totalBytes, proxyResponseTime);
+                        req.lastLogTime = now;
+                    }
+                }
+                return originalWrite.call(this, chunk, encoding, callback);
+            };
+
+            res.end = function(chunk, encoding, callback) {
+                const endTime = Date.now();
+                if (chunk) {
+                    totalBytes += chunk.length;
+                    stats.totalBytes += chunk.length;
+                }
+
+                // 更新统计信息
+                stats.chunks++;
+                stats.lastUpdate = endTime;
+                stats.totalTimeToProxy = proxyResponseTime - req.startTime;
+                stats.totalTimeToClient = endTime - proxyResponseTime;
+
+                // 记录最终速度
+                logSpeed(req, stats, totalBytes, proxyResponseTime, true);
+
+                return originalEnd.call(this, chunk, encoding, callback);
+            };
+
+            // 对视频流的特殊处理
+            proxyRes.headers['Cache-Control'] = 'public, max-age=3600';
+            if (res.socket) {
+                res.socket.setNoDelay(true);
+            }
+        } else {
+            // 非媒体流请求，只需要简单地传递数据
+            const originalWrite = res.write;
+            const originalEnd = res.end;
+
+            res.write = function(chunk, encoding, callback) {
+                return originalWrite.call(this, chunk, encoding, callback);
+            };
+
+            res.end = function(chunk, encoding, callback) {
+                return originalEnd.call(this, chunk, encoding, callback);
+            };
+        }
+    },
+    onError: (err, req, res) => {
+        console.error('Proxy Error:', err);
+        if (!res.headersSent) {
+            res.status(502).json({ 
+                error: 'Proxy Error', 
+                message: 'Failed to connect to Emby server',
+                details: err.message 
+            });
+        }
+    }
+};
+
+// 设置代理中间件
+app.use('/', createProxyMiddleware(proxyOptions));
+
 // 启动服务器
-server.listen(PORT, '0.0.0.0', () => {
-    log(`代理服务器运行在端口 ${PORT}`);
+app.listen(port, '0.0.0.0', () => {
+    console.log(`Proxy server is running on port ${port}`);
 }); 
