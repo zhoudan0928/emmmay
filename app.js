@@ -76,6 +76,15 @@ app.get('/healthz', (req, res) => {
     res.json({ status: 'healthy' });
 });
 
+// 获取默认User-Agent
+function getDefaultUserAgent(isMobile = false) {
+    if (isMobile) {
+        return "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36";
+    } else {
+        return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+    }
+}
+
 // 配置代理选项
 const proxyOptions = {
     target: EMBY_SERVER,
@@ -91,9 +100,37 @@ const proxyOptions = {
         req.bytesWritten = 0;
         req.lastLogTime = Date.now();
 
+        const targetHost = new URL(EMBY_SERVER).host;
+        const isMobile = req.headers['sec-ch-ua-mobile'] === '?1';
+
         // 添加必要的请求头
-        proxyReq.setHeader('X-Forwarded-For', req.ip);
-        proxyReq.setHeader('X-Forwarded-Proto', 'https');
+        proxyReq.setHeader('User-Agent', getDefaultUserAgent(isMobile));
+        proxyReq.setHeader('Host', targetHost);
+        proxyReq.setHeader('Origin', `https://${targetHost}`);
+        proxyReq.setHeader('Referer', `https://${targetHost}/`);
+        
+        // 保留原始请求的一些重要头
+        if (req.headers['accept']) {
+            proxyReq.setHeader('Accept', req.headers['accept']);
+        }
+        if (req.headers['accept-language']) {
+            proxyReq.setHeader('Accept-Language', req.headers['accept-language']);
+        }
+        if (req.headers['accept-encoding']) {
+            proxyReq.setHeader('Accept-Encoding', req.headers['accept-encoding']);
+        }
+        
+        // 添加其他必要的头
+        proxyReq.setHeader('Connection', 'keep-alive');
+        proxyReq.setHeader('Sec-Fetch-Dest', req.headers['sec-fetch-dest'] || 'empty');
+        proxyReq.setHeader('Sec-Fetch-Mode', req.headers['sec-fetch-mode'] || 'cors');
+        proxyReq.setHeader('Sec-Fetch-Site', 'same-origin');
+        
+        // 对于非API请求，添加浏览器特征头
+        if (!req.path.startsWith('/emby')) {
+            proxyReq.setHeader('Upgrade-Insecure-Requests', '1');
+            proxyReq.setHeader('Sec-Fetch-User', '?1');
+        }
     },
     onProxyRes: (proxyRes, req, res) => {
         // 记录代理服务器响应时间
